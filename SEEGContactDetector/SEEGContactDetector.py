@@ -1536,7 +1536,15 @@ class SEEGContactDetectorLogic(ScriptedLoadableModuleLogic):
                               electrodes: list[Electrode],
                               contact_diameter_mm: float,
                               metal_threshold: float,
-                              add_segmentation: bool):
+                              add_segmentation: bool,
+                              restrict_to_trajectory: bool = True):
+        """Cluster metal voxels inside the brain mask into one cluster per seeded electrode (GMM).
+
+        Upstream assigned *every* metal voxel in the mask to one of the seeded electrodes, which only works if a bolt
+        is placed for every implanted electrode: with a partial set of bolts, the unseeded electrodes' metal is pulled
+        into the seeded clusters and the trajectory fit goes wrong. With restrict_to_trajectory, only metal near a seeded
+        electrode's predicted path (entry to tip, see trajectory_tube_mask) is clustered; bolt voxels are always kept.
+        """
         # import or install dependencies
         try:
             import scipy
@@ -1557,6 +1565,15 @@ class SEEGContactDetectorLogic(ScriptedLoadableModuleLogic):
 
         # apply brain mask and threshold
         ct_array[(brain_mask_array == 0) | (ct_array < metal_threshold)] = 0
+
+        if restrict_to_trajectory:
+            # ignore metal far from every seeded electrode (unseeded electrodes, other hardware, artifacts)
+            metal_ijk = np.array(np.nonzero(ct_array)).T
+            near = np.zeros(len(metal_ijk), dtype=bool)
+            for electrode in electrodes:
+                near |= self.trajectory_tube_mask(metal_ijk, electrode, inputCT)
+            far_i, far_j, far_k = metal_ijk[~near].T
+            ct_array[far_i, far_j, far_k] = 0
 
         # include bolt area
         for electrode in electrodes:
@@ -1604,6 +1621,10 @@ class SEEGContactDetectorLogic(ScriptedLoadableModuleLogic):
 
             # get points for current electrode from gmm segmentation
             electrode_points = points[labels == electrode_idx]
+            if len(electrode_points) == 0:
+                slicer.util.errorDisplay(f"No metal was assigned to electrode {electrode.label_prefix}. Check its bolt "
+                                         "fiducial, contact count and contact length/gap.", windowTitle="Error")
+                raise ValueError(f"Empty electrode segmentation for electrode {electrode.label_prefix}")
 
             min_voxel = np.min(electrode_points, axis=0)
             max_voxel = np.max(electrode_points, axis=0)
@@ -1630,6 +1651,40 @@ class SEEGContactDetectorLogic(ScriptedLoadableModuleLogic):
                 segmentId = segmentationNode.GetSegmentation().AddEmptySegment()
                 segmentationNode.GetSegmentation().GetSegment(segmentId).SetName(f"Electrode {electrode.label_prefix}")
                 slicer.util.updateSegmentBinaryLabelmapFromArray(gmm_volume_array, segmentationNode, segmentId)
+
+    def trajectory_tube_mask(self,
+                             points_ijk: np.ndarray,
+                             electrode: Electrode,
+                             inputCT: vtkMRMLScalarVolumeNode,
+                             radius_entry_mm: float = 3.0,
+                             radius_tip_mm: float = 4.0,
+                             extension_mm: float = 12.0) -> np.ndarray:
+        """Boolean mask of the points (numpy KJI indices, like the rest of this module) that lie within a tube around
+        the electrode's predicted straight path, from the entry point to the tip extended by extension_mm. The tube
+        radius grows linearly from radius_entry_mm to radius_tip_mm to allow for electrode bending.
+        Distances are computed in mm (voxel spacing applied; the direction matrix is a rotation and preserves them).
+
+        Defaults chosen on the upstream sample case (2026-10-21): each electrode's metal stays within 3 mm of its straight
+        predicted path but extends 8-10 mm beyond the predicted tip (the tip estimate n*(length+gap) from the bolt is
+        short). A wider tube picks up neighbouring electrodes where tips converge. Seeding every electrode is still the
+        most reliable: then the GMM separates touching electrodes and this gating changes nothing.
+        """
+        spacing_kji = np.array(inputCT.GetSpacing())[::-1]
+        entry_mm = electrode.entry_point_ijk * spacing_kji
+        tip_mm = electrode.tip_ijk * spacing_kji
+        length_mm = np.linalg.norm(tip_mm - entry_mm)
+        if length_mm == 0:
+            return np.zeros(len(points_ijk), dtype=bool)
+        direction = (tip_mm - entry_mm) / length_mm
+        tip_mm = tip_mm + extension_mm * direction
+        length_mm += extension_mm
+
+        points_mm = points_ijk * spacing_kji
+        t = np.clip((points_mm - entry_mm) @ direction / length_mm, 0.0, 1.0)
+        closest_mm = entry_mm + np.outer(t * length_mm, direction)
+        distance_mm = np.linalg.norm(points_mm - closest_mm, axis=1)
+        radius_mm = radius_entry_mm + (radius_tip_mm - radius_entry_mm) * t
+        return distance_mm <= radius_mm
 
     def bolt_axis_estimation(self,
                              inputCT: vtkMRMLScalarVolumeNode,
