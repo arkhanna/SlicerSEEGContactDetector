@@ -1,8 +1,20 @@
+# Modified by Arjun Khanna (2026): optional external (native) HD-BET backend for Apple Silicon, input validation,
+# error handling and Cancel for Run / Create from T1, and no empty brain mask left behind on failure.
+# Original: https://github.com/EpiReC-ISARG/SlicerSEEGContactDetector (Apache-2.0)
+import glob
 import logging
 import os
-from typing import Annotated, Optional
+import platform
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+from typing import Annotated, Callable, Optional
 import re
 
+import ctk
 import qt
 import vtk
 
@@ -34,7 +46,10 @@ class SEEGContactDetector(ScriptedLoadableModule):
         ScriptedLoadableModule.__init__(self, parent)
         self.parent.title = _("SEEG Contact Detector")
         self.parent.categories = [translate("qSlicerAbstractCoreModule", "IGT")] # set categories (folders where the module shows up in the module selector)
-        self.parent.dependencies = ["HDBrainExtractionTool"]  # add here list of module names that this module requires
+        # HDBrainExtractionTool is optional: it is only needed for the "Slicer" HD-BET backend. On Apple Silicon,
+        # Slicer runs under Rosetta where PyTorch cannot run with Slicer's NumPy 2, so the "external" backend
+        # (HD-BET in a native Python environment) is used instead.
+        self.parent.dependencies = []
         self.parent.contributors = ["Jakub Smid (CTU in Prague, Charles University)", "Petr Jezdik (CTU in Prague)", "Radek Janca (CTU in Prague)"]
         # _() function marks text as translatable to other languages
         self.parent.helpText = _("""
@@ -112,6 +127,104 @@ def registerSampleData():
         checksums="SHA256:88ff8700b3c57e02fd12d370dc705edb1bf9bc9039c42aaf7c0f408823d3e109",
         nodeNames="Bolt fiducials",
     )
+
+
+#
+# External (native) HD-BET helpers
+#
+# Slicer has no native Apple Silicon build, so on an M-series Mac it runs as an Intel app under Rosetta.
+# There, the newest PyTorch available to Slicer's Python (2.2.2) is built against NumPy 1.x while Slicer ships
+# NumPy 2.x, and HD-BET fails with "Numpy is not available". The external backend runs the `hd-bet` command
+# from a separate, native Python environment (e.g. a conda env with `pip install hd-bet`) as a subprocess.
+#
+
+HDBET_SETTINGS_PREFIX = "SEEGContactDetector/HDBET"
+HDBET_BACKEND_SLICER = "slicer"
+HDBET_BACKEND_EXTERNAL = "external"
+
+
+class HDBETCancelledError(Exception):
+    """Raised when the user cancels the external HD-BET run."""
+
+
+def isRunningUnderRosetta() -> bool:
+    """True if this (Slicer) process is an x86_64 binary translated by Rosetta on Apple Silicon."""
+    if sys.platform != "darwin":
+        return False
+    try:
+        out = subprocess.run(["sysctl", "-n", "sysctl.proc_translated"], capture_output=True, text=True, timeout=5)
+        return out.stdout.strip() == "1"
+    except Exception:
+        return False
+
+
+def isAppleSilicon() -> bool:
+    return sys.platform == "darwin" and (platform.machine() == "arm64" or isRunningUnderRosetta())
+
+
+def defaultHDBETBackend() -> str:
+    return HDBET_BACKEND_EXTERNAL if isAppleSilicon() else HDBET_BACKEND_SLICER
+
+
+def defaultHDBETDevice() -> str:
+    return "mps" if isAppleSilicon() else "cpu"
+
+
+def cleanSubprocessEnvironment() -> dict:
+    """Environment for launching an external Python program from Slicer.
+
+    Slicer's launcher sets PYTHONHOME, PYTHONPATH and library paths that would make another Python
+    load Slicer's packages and libraries. Start from the environment Slicer was started with instead.
+    """
+    try:
+        env = dict(slicer.util.startupEnvironment())
+    except Exception:
+        env = dict(os.environ)
+    for key in ("PYTHONHOME", "PYTHONPATH", "PYTHONNOUSERSITE", "PYTHONSTARTUP", "PYTHONEXECUTABLE",
+                "DYLD_LIBRARY_PATH", "DYLD_FRAMEWORK_PATH", "DYLD_FALLBACK_LIBRARY_PATH", "LD_LIBRARY_PATH",
+                "QT_PLUGIN_PATH", "SSL_CERT_FILE", "SSL_CERT_DIR"):
+        env.pop(key, None)
+    env["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"  # run any op not implemented on MPS on the CPU instead of failing
+    env["PYTHONUNBUFFERED"] = "1"
+    return env
+
+
+def findHDBETExecutable() -> str:
+    """Best-effort search for an `hd-bet` command in common conda/venv locations. Returns "" if none found."""
+    exe = "hd-bet.exe" if sys.platform == "win32" else "hd-bet"
+    found = shutil.which(exe, path=cleanSubprocessEnvironment().get("PATH", ""))
+    if found:
+        return found
+    home = os.path.expanduser("~")
+    bindir = "Scripts" if sys.platform == "win32" else "bin"
+    roots = [os.path.join(home, d) for d in ("miniconda3", "miniforge3", "mambaforge", "anaconda3", "micromamba")]
+    roots += ["/opt/miniconda3", "/opt/miniforge3", "/opt/anaconda3", "/opt/homebrew/Caskroom/miniforge/base",
+              "/opt/homebrew/Caskroom/miniconda/base"]
+    candidates = []
+    for root in roots:
+        candidates += glob.glob(os.path.join(root, "envs", "*", bindir, exe))
+        candidates.append(os.path.join(root, bindir, exe))
+    for candidate in candidates:
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return ""
+
+
+def loadHDBETSettings() -> dict:
+    settings = qt.QSettings()
+    backend = settings.value(f"{HDBET_SETTINGS_PREFIX}/Backend", "") or defaultHDBETBackend()
+    executable = settings.value(f"{HDBET_SETTINGS_PREFIX}/Executable", "") or findHDBETExecutable()
+    device = settings.value(f"{HDBET_SETTINGS_PREFIX}/Device", "") or defaultHDBETDevice()
+    disableTTA = str(settings.value(f"{HDBET_SETTINGS_PREFIX}/DisableTTA", "false")).lower() == "true"
+    return {"backend": backend, "executable": executable, "device": device, "disableTTA": disableTTA}
+
+
+def saveHDBETSettings(backend: str, executable: str, device: str, disableTTA: bool) -> None:
+    settings = qt.QSettings()
+    settings.setValue(f"{HDBET_SETTINGS_PREFIX}/Backend", backend)
+    settings.setValue(f"{HDBET_SETTINGS_PREFIX}/Executable", executable)
+    settings.setValue(f"{HDBET_SETTINGS_PREFIX}/Device", device)
+    settings.setValue(f"{HDBET_SETTINGS_PREFIX}/DisableTTA", "true" if disableTTA else "false")
 
 
 #
@@ -272,8 +385,66 @@ class SEEGContactDetectorWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self.ui.buttonElectrodeSegmentation.connect("clicked(bool)", self.onElectrodeSegmentationClicked)
         self.ui.buttonCurveFitting.connect("clicked(bool)", self.onCurveFittingClicked)
 
+        self.setupHDBETSettingsWidgets()
+
         # Make sure parameter node is initialized (needed for module reload)
         self.initializeParameterNode()
+
+    def setupHDBETSettingsWidgets(self) -> None:
+        """Brain mask (HD-BET) backend settings, stored per machine in QSettings rather than in the scene."""
+        hdbet = loadHDBETSettings()
+
+        groupBox = qt.QGroupBox("Brain mask (HD-BET)")
+        form = qt.QFormLayout(groupBox)
+
+        self.hdbetBackendComboBox = qt.QComboBox()
+        self.hdbetBackendComboBox.addItem("External HD-BET (native Python)", HDBET_BACKEND_EXTERNAL)
+        self.hdbetBackendComboBox.addItem("HDBrainExtraction extension (inside Slicer)", HDBET_BACKEND_SLICER)
+        self.hdbetBackendComboBox.setToolTip(
+            "External: runs the 'hd-bet' command from a separate Python environment. Required on Apple Silicon Macs, "
+            "where Slicer runs under Rosetta and PyTorch does not work inside Slicer.\n"
+            "Inside Slicer: uses the HDBrainExtraction extension (Windows/Linux).")
+        self.hdbetBackendComboBox.setCurrentIndex(max(0, self.hdbetBackendComboBox.findData(hdbet["backend"])))
+        form.addRow("Backend:", self.hdbetBackendComboBox)
+
+        self.hdbetExecutablePathLineEdit = ctk.ctkPathLineEdit()
+        self.hdbetExecutablePathLineEdit.filters = ctk.ctkPathLineEdit.Files | ctk.ctkPathLineEdit.Executable
+        self.hdbetExecutablePathLineEdit.settingKey = ""
+        self.hdbetExecutablePathLineEdit.currentPath = hdbet["executable"]
+        self.hdbetExecutablePathLineEdit.setToolTip(
+            "Path to the 'hd-bet' command in a native Python environment, e.g. "
+            "/opt/miniconda3/envs/<env>/bin/hd-bet (install with: pip install hd-bet).")
+        form.addRow("hd-bet command:", self.hdbetExecutablePathLineEdit)
+
+        self.hdbetDeviceComboBox = qt.QComboBox()
+        self.hdbetDeviceComboBox.addItems(["mps", "cpu", "cuda"])
+        self.hdbetDeviceComboBox.setToolTip("mps = Apple Silicon GPU; cuda = NVIDIA GPU; cpu = slowest, always works.")
+        self.hdbetDeviceComboBox.setCurrentIndex(max(0, self.hdbetDeviceComboBox.findText(hdbet["device"])))
+        form.addRow("Device:", self.hdbetDeviceComboBox)
+
+        self.hdbetDisableTTACheckBox = qt.QCheckBox("Fast mode (disable test-time augmentation)")
+        self.hdbetDisableTTACheckBox.setToolTip("Several times faster, with a slight decrease in mask quality.")
+        self.hdbetDisableTTACheckBox.setChecked(hdbet["disableTTA"])
+        form.addRow(self.hdbetDisableTTACheckBox)
+
+        layout = self.ui.collapsibleButtonAdvanced.layout()
+        layout.addWidget(groupBox, layout.rowCount(), 0, 1, 2)
+
+        self.hdbetBackendComboBox.connect("currentIndexChanged(int)", self.onHDBETSettingsChanged)
+        self.hdbetExecutablePathLineEdit.connect("currentPathChanged(QString)", self.onHDBETSettingsChanged)
+        self.hdbetDeviceComboBox.connect("currentIndexChanged(int)", self.onHDBETSettingsChanged)
+        self.hdbetDisableTTACheckBox.connect("toggled(bool)", self.onHDBETSettingsChanged)
+        self.onHDBETSettingsChanged()
+
+    def onHDBETSettingsChanged(self, *args) -> None:
+        external = self.hdbetBackendComboBox.currentData == HDBET_BACKEND_EXTERNAL
+        self.hdbetExecutablePathLineEdit.setEnabled(external)
+        self.hdbetDeviceComboBox.setEnabled(external)
+        self.hdbetDisableTTACheckBox.setEnabled(external)
+        saveHDBETSettings(self.hdbetBackendComboBox.currentData,
+                          self.hdbetExecutablePathLineEdit.currentPath,
+                          self.hdbetDeviceComboBox.currentText,
+                          self.hdbetDisableTTACheckBox.checked)
 
     def onCheckBoxProjectionVisibilityClicked(self, checked):
         if checked:
@@ -366,27 +537,54 @@ class SEEGContactDetectorWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             if self.detected_list_markup_node:
                 self.detected_list_markup_node.SetDisplayVisibility(True)
 
+    def validateBrainMask(self) -> Optional[str]:
+        """Return an error message if the selected brain mask cannot be used, else None."""
+        mask = self._parameterNode.brainMask
+        if mask is None:
+            return "No brain mask is selected."
+        segmentIDs = mask.GetSegmentation().GetSegmentIDs()
+        if len(segmentIDs) == 0:
+            return (f"The brain mask '{mask.GetName()}' has no segments. "
+                    "Create it from the T1 again, or load an existing brain mask segmentation.")
+        maskArray = slicer.util.arrayFromSegmentBinaryLabelmap(mask, segmentIDs[0], self._parameterNode.inputCT)
+        if maskArray is None or not maskArray.any():
+            return (f"The first segment of the brain mask '{mask.GetName()}' is empty (or does not overlap the CT). "
+                    "Create it from the T1 again, or load an existing brain mask segmentation.")
+        return None
+
     def onRunClicked(self):
+        maskError = self.validateBrainMask()
+        if maskError:
+            slicer.util.errorDisplay(maskError, windowTitle="Brain mask")
+            return
+
         progressbar = slicer.util.createProgressDialog(windowTitle="Detecting contacts")
-        progressbar.setCancelButton(None)
-
-        progressbar.labelText = "Loading input data and segmenting bolts..."
-        self.onBoltSegmentationClicked()
-
-        progressbar.value = 30
-        progressbar.labelText = "Estimating bolt axis..."
-        self.onBoltAxisEstClicked()
-
-        progressbar.value = 50
-        progressbar.labelText = "Segmenting electrodes (GMM)..."
-        self.onElectrodeSegmentationClicked()
-
-        progressbar.value = 70
-        progressbar.labelText = "Fitting curves and electrode models..."
-        self.onCurveFittingClicked()
-        
-        progressbar.labelText = "Done..."
-        progressbar.value = 100
+        stages = [
+            (0, "Loading input data and segmenting bolts...", self.onBoltSegmentationClicked),
+            (30, "Estimating bolt axis...", self.onBoltAxisEstClicked),
+            (50, "Segmenting electrodes (GMM)...", self.onElectrodeSegmentationClicked),
+            (70, "Fitting curves and electrode models...", self.onCurveFittingClicked),
+        ]
+        try:
+            for value, label, stage in stages:
+                if progressbar.wasCanceled:
+                    logging.info("Contact detection cancelled by the user")
+                    return
+                progressbar.value = value
+                progressbar.labelText = label
+                slicer.app.processEvents()
+                stage()
+            progressbar.labelText = "Done..."
+            progressbar.value = 100
+        except ValueError as e:
+            # upstream stages show their own error dialog before raising ValueError
+            logging.error(f"Contact detection stopped: {e}")
+        except Exception as e:
+            logging.exception("Contact detection failed")
+            slicer.util.errorDisplay(f"Contact detection failed during '{label.rstrip('.')}':\n\n{e}",
+                                     windowTitle="Error", detailedText=str(e))
+        finally:
+            progressbar.close()
 
     def onSpinBoxShiftElectrodeMicrostepChanged(self, spin_box_value):
         self.detected_list_selected_electrode.curve_points_offset = spin_box_value
@@ -556,14 +754,39 @@ class SEEGContactDetectorWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         slicer.util.resetSliceViews()
 
     def onCreateFromT1Clicked(self):
-        with slicer.util.WaitCursor():
-            transformNode, segmentationNodeBET = self.logic.register_and_brain_mask(
-                inputCT=self._parameterNode.inputCT,
-                inputT1=self._parameterNode.inputT1,
-                metalThreshold_HU=self._parameterNode.metalThreshold_HU,
-                skipRegistration=self._parameterNode.skipRegistration,
-                save=self._parameterNode.autoSave,
-                path=self.ui.pathLineEditSavePath.currentPath)
+        hdbet = loadHDBETSettings()
+        progressbar = slicer.util.createProgressDialog(windowTitle="Creating brain mask", maximum=100)
+        progressbar.setMinimumDuration(0)
+
+        def progress(fraction: float, text: str) -> bool:
+            progressbar.value = int(100 * fraction)
+            progressbar.labelText = text
+            slicer.app.processEvents()
+            return not progressbar.wasCanceled
+
+        try:
+            with slicer.util.WaitCursor():
+                transformNode, segmentationNodeBET = self.logic.register_and_brain_mask(
+                    inputCT=self._parameterNode.inputCT,
+                    inputT1=self._parameterNode.inputT1,
+                    metalThreshold_HU=self._parameterNode.metalThreshold_HU,
+                    skipRegistration=self._parameterNode.skipRegistration,
+                    save=self._parameterNode.autoSave,
+                    path=self.ui.pathLineEditSavePath.currentPath,
+                    hdbetBackend=hdbet["backend"],
+                    hdbetExecutable=hdbet["executable"],
+                    hdbetDevice=hdbet["device"],
+                    hdbetDisableTTA=hdbet["disableTTA"],
+                    progressCallback=progress)
+        except HDBETCancelledError:
+            logging.info("Brain mask creation cancelled by the user")
+            return
+        except Exception as e:
+            logging.exception("Brain mask creation failed")
+            slicer.util.errorDisplay(f"Brain mask creation failed:\n\n{e}", windowTitle="Brain mask")
+            return
+        finally:
+            progressbar.close()
 
             # update parameter node
             self._parameterNode.brainMask = segmentationNodeBET
@@ -820,48 +1043,95 @@ class SEEGContactDetectorLogic(ScriptedLoadableModuleLogic):
             metalThreshold_HU: float,
             skipRegistration: bool,
             save: bool,
-            path: str) -> tuple[vtkMRMLTransformNode, vtkMRMLSegmentationNode]:
+            path: str,
+            hdbetBackend: str = HDBET_BACKEND_SLICER,
+            hdbetExecutable: Optional[str] = None,
+            hdbetDevice: str = "cpu",
+            hdbetDisableTTA: bool = False,
+            progressCallback: Optional[Callable[[float, str], bool]] = None) -> tuple[vtkMRMLTransformNode, vtkMRMLSegmentationNode]:
+                """Rigidly register the T1 to the CT (BRAINSFit) and create a brain mask from the T1 with HD-BET.
+
+                hdbetBackend "slicer" uses the HDBrainExtraction extension inside Slicer; "external" runs the
+                `hd-bet` command given by hdbetExecutable in a native Python environment (needed on Apple Silicon).
+                progressCallback(fraction, text) is called with progress and returns False to cancel.
+                Nodes created here are removed again if anything fails, so no empty mask is left in the scene.
+                """
+                def report(fraction: float, text: str) -> None:
+                    if progressCallback is not None and not progressCallback(fraction, text):
+                        raise HDBETCancelledError()
+
+                if hdbetBackend == HDBET_BACKEND_EXTERNAL:
+                    # check the command before spending time on registration
+                    self.checkHDBETExecutable(hdbetExecutable)
+
                 # coregister T1 to CT
                 fixedVolumeNode = inputCT
                 movingVolumeNode = inputT1
+                transformNode = None
+                segmentationNodeROI = None
+                segmentationNodeBET = None
 
-                if not skipRegistration:
-                    # create ROI segmentation for registration
-                    segmentationNodeROI = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentationNode")
-                    segmentationNodeROI.SetReferenceImageGeometryParameterFromVolumeNode(inputCT)
-                    segmentationNodeROI.CreateDefaultDisplayNodes()
-                    segmentId = segmentationNodeROI.GetSegmentation().AddEmptySegment()
-                    segmentationNodeROI.GetSegmentation().GetSegment(segmentId)
-                    segmentation_array = (slicer.util.arrayFromVolume(fixedVolumeNode) < metalThreshold_HU).astype(np.uint8)
-                    slicer.util.updateSegmentBinaryLabelmapFromArray(segmentation_array, segmentationNodeROI, segmentId)
+                try:
+                    if not skipRegistration:
+                        report(0.0, "Registering T1 to CT (BRAINSFit)...")
+                        # create ROI segmentation for registration
+                        segmentationNodeROI = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentationNode")
+                        segmentationNodeROI.SetReferenceImageGeometryParameterFromVolumeNode(inputCT)
+                        segmentationNodeROI.CreateDefaultDisplayNodes()
+                        segmentId = segmentationNodeROI.GetSegmentation().AddEmptySegment()
+                        segmentationNodeROI.GetSegmentation().GetSegment(segmentId)
+                        segmentation_array = (slicer.util.arrayFromVolume(fixedVolumeNode) < metalThreshold_HU).astype(np.uint8)
+                        slicer.util.updateSegmentBinaryLabelmapFromArray(segmentation_array, segmentationNodeROI, segmentId)
 
-                    transformNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLTransformNode", slicer.mrmlScene.GenerateUniqueName("Transform T1 to CT"))
+                        transformNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLTransformNode", slicer.mrmlScene.GenerateUniqueName("Transform T1 to CT"))
 
-                    # Run registration
-                    parameters = {}
-                    parameters["fixedVolume"] = fixedVolumeNode.GetID()
-                    parameters["movingVolume"] = movingVolumeNode.GetID()
-                    parameters["linearTransform"] = transformNode.GetID()
-                    parameters["useRigid"] = True
-                    parameters["samplingPercentage"] = 0.01
-                    parameters["initializeTransformMode"] = "useGeometryAlign"
-                    parameters["maskProcessingMode"] = "ROI"
-                    parameters["fixedBinaryVolume"] = segmentationNodeROI.GetID()
-                    cliBrainsFitRigidNode = slicer.cli.run(slicer.modules.brainsfit, None, parameters, wait_for_completion=True)
+                        # Run registration
+                        parameters = {}
+                        parameters["fixedVolume"] = fixedVolumeNode.GetID()
+                        parameters["movingVolume"] = movingVolumeNode.GetID()
+                        parameters["linearTransform"] = transformNode.GetID()
+                        parameters["useRigid"] = True
+                        parameters["samplingPercentage"] = 0.01
+                        parameters["initializeTransformMode"] = "useGeometryAlign"
+                        parameters["maskProcessingMode"] = "ROI"
+                        parameters["fixedBinaryVolume"] = segmentationNodeROI.GetID()
+                        cliBrainsFitRigidNode = slicer.cli.run(slicer.modules.brainsfit, None, parameters, wait_for_completion=True)
+                        if cliBrainsFitRigidNode.GetStatus() == cliBrainsFitRigidNode.CompletedWithErrors:
+                            raise RuntimeError(f"T1 to CT registration (BRAINSFit) failed:\n{cliBrainsFitRigidNode.GetErrorText()}")
 
-                    # remove ROI segmentation
-                    slicer.mrmlScene.RemoveNode(segmentationNodeROI)
+                        # remove ROI segmentation
+                        slicer.mrmlScene.RemoveNode(segmentationNodeROI)
+                        segmentationNodeROI = None
 
-                segmentationNodeBET = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentationNode", slicer.mrmlScene.GenerateUniqueName("CT Brain mask"))
+                    report(0.1, "Creating brain mask with HD-BET...")
+                    segmentationNodeBET = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentationNode", slicer.mrmlScene.GenerateUniqueName("CT Brain mask"))
 
-                # run HD-BET
-                import HDBrainExtractionTool as hd_bet
-                hd_bet_logic = hd_bet.HDBrainExtractionToolLogic()
-                hd_bet_logic.setupPythonRequirements()
-                hd_bet_logic.process(inputT1, None, segmentationNodeBET, "cpu")
-                if not skipRegistration:
-                    segmentationNodeBET.SetAndObserveTransformNodeID(transformNode.GetID())
-                    segmentationNodeBET.HardenTransform()
+                    # run HD-BET
+                    if hdbetBackend == HDBET_BACKEND_EXTERNAL:
+                        self.run_hdbet_external(inputT1, segmentationNodeBET, hdbetExecutable, hdbetDevice, hdbetDisableTTA,
+                                                lambda f, text: report(0.1 + 0.85 * f, text))
+                    else:
+                        try:
+                            import HDBrainExtractionTool as hd_bet
+                        except ImportError:
+                            raise RuntimeError("The HDBrainExtraction extension is not installed. Install it from the "
+                                               "Extensions Manager, or switch the HD-BET backend to 'External' in Advanced.")
+                        hd_bet_logic = hd_bet.HDBrainExtractionToolLogic()
+                        hd_bet_logic.setupPythonRequirements()
+                        hd_bet_logic.process(inputT1, None, segmentationNodeBET, "cpu")
+
+                    if segmentationNodeBET.GetSegmentation().GetNumberOfSegments() == 0:
+                        raise RuntimeError("HD-BET did not produce a brain mask segment.")
+
+                    if not skipRegistration:
+                        segmentationNodeBET.SetAndObserveTransformNodeID(transformNode.GetID())
+                        segmentationNodeBET.HardenTransform()
+                except Exception:
+                    # don't leave half-made nodes behind: an empty "CT Brain mask" would be auto-selected later
+                    for node in (segmentationNodeROI, segmentationNodeBET, transformNode):
+                        if node is not None and node.GetScene() is not None:
+                            slicer.mrmlScene.RemoveNode(node)
+                    raise
 
                 # save segmentation
                 if save and path:
@@ -869,7 +1139,133 @@ class SEEGContactDetectorLogic(ScriptedLoadableModuleLogic):
                     if not skipRegistration:
                         slicer.util.saveNode(transformNode, os.path.join(path, "transform_T1_to_CT_autosave.h5"))
 
+                report(1.0, "Done")
                 return [transformNode if not skipRegistration else None, segmentationNodeBET]
+
+    def checkHDBETExecutable(self, executable: Optional[str]) -> None:
+        if not executable:
+            raise RuntimeError("The external HD-BET command is not set. In Advanced > Brain mask (HD-BET), set "
+                               "'hd-bet command' to the hd-bet program of a native Python environment "
+                               "(for example: conda create -n hdbet python=3.12; conda activate hdbet; "
+                               "pip install hd-bet; then use <env>/bin/hd-bet).")
+        if not (os.path.isfile(executable) and os.access(executable, os.X_OK)):
+            raise RuntimeError(f"The HD-BET command was not found or is not executable:\n{executable}")
+
+    def run_hdbet_external(self,
+            inputT1: vtkMRMLScalarVolumeNode,
+            segmentationNode: vtkMRMLSegmentationNode,
+            executable: str,
+            device: str = "mps",
+            disableTTA: bool = False,
+            progressCallback: Optional[Callable[[float, str], None]] = None) -> None:
+        """Run the `hd-bet` command of a native Python environment on inputT1 and import the mask into segmentationNode.
+
+        The T1 is written to a temporary NIfTI file (deleted afterwards), HD-BET runs as a subprocess with a clean
+        environment (launched with `arch -arm64` when Slicer runs under Rosetta), and the resulting mask, which has
+        the T1's geometry, is imported as a single "Brain" segment. progressCallback(fraction, text) may raise to cancel.
+        """
+        self.checkHDBETExecutable(executable)
+        workDir = tempfile.mkdtemp(prefix="SEEGContactDetector_HDBET_", dir=slicer.app.temporaryPath)
+        process = None
+        labelNode = None
+        try:
+            inputPath = os.path.join(workDir, "T1.nii.gz")
+            outputPath = os.path.join(workDir, "T1_brain.nii.gz")
+            maskPath = os.path.join(workDir, "T1_brain_bet.nii.gz")  # hd-bet appends "_bet" to the output name
+            logPath = os.path.join(workDir, "hd-bet.log")
+            if not slicer.util.saveNode(inputT1, inputPath):
+                raise RuntimeError("Could not write the T1 to a temporary file for HD-BET.")
+
+            command = [executable, "-i", inputPath, "-o", outputPath, "-device", device,
+                       "--save_bet_mask", "--no_bet_image"]
+            if disableTTA:
+                command.append("--disable_tta")
+            if isRunningUnderRosetta():
+                command = ["arch", "-arm64"] + command  # run the native arm64 environment, not under Rosetta
+            logging.info("Running external HD-BET: " + " ".join(command))
+
+            popenKwargs = {}
+            if sys.platform == "win32":
+                popenKwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+            else:
+                popenKwargs["start_new_session"] = True  # so Cancel can stop HD-BET's worker processes too
+            with open(logPath, "wb") as logFile:
+                process = subprocess.Popen(command, stdout=logFile, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                           cwd=workDir, env=cleanSubprocessEnvironment(), **popenKwargs)
+
+            # hd-bet prints: [weights download progress] -> "Predicting <file>:" -> tqdm "k/N [..." over the
+            # sliding-window steps -> "done with <file>" -> export. Parse the whole (small) log on each poll.
+            stepPattern = re.compile(r"(\d+)/(\d+) \[")
+            percentPattern = re.compile(r"(\d+)%\|")
+            while process.poll() is None:
+                time.sleep(0.25)
+                log = self._read_log_tail(logPath, maxBytes=1_000_000)
+                fraction, text = 0.05, f"Starting HD-BET on {device}..."
+                if "Predicting" in log:
+                    prediction = log[log.rfind("Predicting"):]
+                    steps = stepPattern.findall(prediction)
+                    done, total = (int(x) for x in steps[-1]) if steps else (0, 1)
+                    fraction = 0.2 + 0.75 * done / max(total, 1)
+                    text = f"Running HD-BET on {device}: step {done} of {total}" if steps else text
+                    if "done with" in prediction:
+                        fraction, text = 0.95, "Writing brain mask..."
+                elif "tmp_download" in log or "zenodo" in log.lower():
+                    percent = percentPattern.findall(log)
+                    fraction = 0.2 * int(percent[-1]) / 100 if percent else 0.0
+                    text = "Downloading HD-BET model weights (first run only)..."
+                if progressCallback is not None:
+                    progressCallback(fraction, text)  # may raise HDBETCancelledError
+                slicer.app.processEvents()
+
+            log = self._read_log_tail(logPath, maxBytes=20000)
+            if process.returncode != 0:
+                lastLines = "\n".join(log.strip().splitlines()[-25:])
+                raise RuntimeError(f"HD-BET exited with code {process.returncode}.\n\nLast output:\n{lastLines}")
+            if not os.path.isfile(maskPath):
+                raise RuntimeError(f"HD-BET finished but did not write a brain mask.\n\nLast output:\n{log[-3000:]}")
+
+            if progressCallback is not None:
+                progressCallback(0.97, "Loading brain mask...")
+            labelNode = slicer.util.loadLabelVolume(maskPath, {"show": False})
+            if not slicer.util.arrayFromVolume(labelNode).any():
+                raise RuntimeError("HD-BET produced an empty brain mask. Check that the T1 is a head MRI and loaded correctly.")
+            if not slicer.modules.segmentations.logic().ImportLabelmapToSegmentationNode(labelNode, segmentationNode):
+                raise RuntimeError("Could not import the HD-BET brain mask into a segmentation.")
+            segmentation = segmentationNode.GetSegmentation()
+            if segmentation.GetNumberOfSegments() > 0:
+                segmentation.GetNthSegment(0).SetName("Brain")
+            segmentationNode.CreateDefaultDisplayNodes()
+        finally:
+            if process is not None and process.poll() is None:
+                self._stop_process(process)
+            if labelNode is not None:
+                slicer.mrmlScene.RemoveNode(labelNode)
+            shutil.rmtree(workDir, ignore_errors=True)  # the T1 copy may contain patient data
+
+    @staticmethod
+    def _read_log_tail(logPath: str, maxBytes: int = 4000) -> str:
+        try:
+            with open(logPath, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                f.seek(max(0, f.tell() - maxBytes))
+                return f.read().decode("utf-8", errors="replace").replace("\r", "\n")
+        except OSError:
+            return ""
+
+    @staticmethod
+    def _stop_process(process: subprocess.Popen) -> None:
+        try:
+            if sys.platform == "win32":
+                process.kill()
+            else:
+                os.killpg(process.pid, signal.SIGTERM)
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=10)
+        except Exception:
+            logging.exception("Could not stop the HD-BET process")
     
     def update_fiducials(self,
                         inputCT: vtkMRMLScalarVolumeNode,
@@ -1504,7 +1900,10 @@ class SEEGContactDetectorTest(ScriptedLoadableModuleTest):
             with slicer.util.WaitCursor():
                 logic = SEEGContactDetectorLogic()
                 self.delayDisplay("Registering and brain masking")
-                transform, brainMask = logic.register_and_brain_mask(inputCT, inputT1, logic.getParameterNode().metalThreshold_HU, False, False, None)
+                hdbet = loadHDBETSettings()
+                transform, brainMask = logic.register_and_brain_mask(inputCT, inputT1, logic.getParameterNode().metalThreshold_HU, False, False, None,
+                                                                     hdbetBackend=hdbet["backend"], hdbetExecutable=hdbet["executable"],
+                                                                     hdbetDevice=hdbet["device"], hdbetDisableTTA=hdbet["disableTTA"])
                 slicer.util.setSliceViewerLayers(inputCT, fit=True) # refocus to CT
                 self.delayDisplay("Loading electrodes")
                 electrodes = logic.load_electrodes(fiducials, logic.getParameterNode().contactLength_mm, logic.getParameterNode().contactGap_mm)

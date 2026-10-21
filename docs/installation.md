@@ -31,3 +31,24 @@ It is recommended to use a [stable release](https://github.com/EpiReC-ISARG/Slic
 6. When you start detection first time, you will be prompted to install the externa
 
 If needed, you can later modify the extension path in: Edit → Application Settings → Modules → Additional module paths.
+## Apple Silicon Macs (M1/M2/M3/M4): brain mask with an external HD-BET
+
+3D Slicer has no native Apple Silicon build yet, so on these Macs it runs as an Intel app under Rosetta. Inside that Slicer, the newest PyTorch available (2.2.2) is incompatible with Slicer's NumPy 2, and *Create from T1* fails in HD-BET ("Numpy is not available"). The rest of the module works normally.
+
+The module can instead run HD-BET from a separate, native Python environment:
+
+1. Create the environment once (conda shown; any Python 3.10–3.13 venv works):
+   ```bash
+   conda create -n hdbet python=3.12
+   conda activate hdbet
+   pip install hd-bet
+   ```
+2. Optional, to avoid the download during the first brain mask: download the HD-BET model weights once with
+   `python -c "from HD_BET.checkpoint_download import maybe_download_parameters as m; m()"`.
+3. In the module, open **Advanced → Brain mask (HD-BET)**:
+   - **Backend:** *External HD-BET (native Python)* (the default on Apple Silicon).
+   - **hd-bet command:** the `hd-bet` program in that environment, e.g. `/opt/miniconda3/envs/hdbet/bin/hd-bet` (found automatically in common conda locations).
+   - **Device:** `mps` (Apple GPU) or `cpu`. **Fast mode** disables test-time augmentation (several times faster, slightly lower quality).
+4. Click **Create from T1** as usual. Registration (BRAINSFit) runs in Slicer; HD-BET runs natively with progress and a **Cancel** button. The T1 is written to a temporary file for HD-BET and deleted afterwards.
+
+On Windows and Linux the *HDBrainExtraction extension (inside Slicer)* backend still works; the external backend works there too.
