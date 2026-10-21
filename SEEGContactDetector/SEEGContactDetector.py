@@ -322,6 +322,7 @@ class SEEGContactDetectorWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self.detected_list_markup_node = None
 
         self.transformNodeInv = None # keep pointer to the CT to T1 transform node (needed in View in Scene)
+        self.transformNodeT1ToCT = None # T1 to CT registration result; the T1 is shown under it (CT space)
         self.inputCT_display_node_normal = None
         self.inputCT_display_node_view_in_scene = None
 
@@ -479,6 +480,17 @@ class SEEGContactDetectorWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         else:
             self.inputCT_display_node_view_in_scene = self._parameterNode.inputCT.GetDisplayNode()
             self._parameterNode.inputCT.SetAndObserveDisplayNodeID(self.inputCT_display_node_normal.GetID())
+            # back to CT space: View in Scene moved the CT, mask, bolts and contacts to T1 space and did not undo it
+            if self.transformNodeInv:
+                for node in (self._parameterNode.inputCT, self._parameterNode.brainMask,
+                             self._parameterNode.boltFiducials, self.detected_list_markup_node):
+                    if node and node.GetParentTransformNode() == self.transformNodeInv:
+                        node.SetAndObserveTransformNodeID(None)
+                if self._parameterNode.inputT1 and self.transformNodeT1ToCT and self.transformNodeT1ToCT.GetScene():
+                    self._parameterNode.inputT1.SetAndObserveTransformNodeID(self.transformNodeT1ToCT.GetID())
+            if self._parameterNode.inputT1:
+                slicer.util.setSliceViewerLayers(background=self._parameterNode.inputCT,
+                                                 foreground=self._parameterNode.inputT1, foregroundOpacity=0.5)
             return
 
         with slicer.util.RenderBlocker():
@@ -795,6 +807,11 @@ class SEEGContactDetectorWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             # the CT, so the alignment can be checked by eye. Upstream only moved the brain mask, which left the T1
             # in its own space and made the volumes look unregistered. (View in Scene still takes the T1 out of
             # the transform and moves the CT to T1 space instead.)
+            self.transformNodeT1ToCT = transformNode
+            if self._parameterNode.inputCT and self._parameterNode.inputCT.GetParentTransformNode():
+                logging.info(f"Removing transform '{self._parameterNode.inputCT.GetParentTransformNode().GetName()}' from the CT: "
+                             "the CT is the reference frame and must not be transformed")
+                self._parameterNode.inputCT.SetAndObserveTransformNodeID(None)
             if transformNode and self._parameterNode.inputT1:
                 self._parameterNode.inputT1.SetAndObserveTransformNodeID(transformNode.GetID())
                 slicer.util.setSliceViewerLayers(background=self._parameterNode.inputCT,
@@ -1084,6 +1101,12 @@ class SEEGContactDetectorLogic(ScriptedLoadableModuleLogic):
                 try:
                     if not skipRegistration:
                         report(0.0, "Registering T1 to CT (BRAINSFit)...")
+                        # register the volumes as loaded, not under a transform from an earlier run or View in Scene
+                        for volumeNode in (fixedVolumeNode, movingVolumeNode):
+                            if volumeNode.GetParentTransformNode():
+                                logging.info(f"Removing transform '{volumeNode.GetParentTransformNode().GetName()}' from "
+                                             f"'{volumeNode.GetName()}' before registration")
+                                volumeNode.SetAndObserveTransformNodeID(None)
                         # create ROI segmentation for registration
                         segmentationNodeROI = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentationNode")
                         segmentationNodeROI.SetReferenceImageGeometryParameterFromVolumeNode(inputCT)
