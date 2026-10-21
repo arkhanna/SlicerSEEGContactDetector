@@ -791,6 +791,16 @@ class SEEGContactDetectorWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             # update parameter node
             self._parameterNode.brainMask = segmentationNodeBET
             
+            # Show the registration result: put the T1 under the T1->CT transform (not hardened) and overlay it on
+            # the CT, so the alignment can be checked by eye. Upstream only moved the brain mask, which left the T1
+            # in its own space and made the volumes look unregistered. (View in Scene still takes the T1 out of
+            # the transform and moves the CT to T1 space instead.)
+            if transformNode and self._parameterNode.inputT1:
+                self._parameterNode.inputT1.SetAndObserveTransformNodeID(transformNode.GetID())
+                slicer.util.setSliceViewerLayers(background=self._parameterNode.inputCT,
+                                                 foreground=self._parameterNode.inputT1, foregroundOpacity=0.5)
+                slicer.util.resetSliceViews()
+
             # clone transformNode
             if transformNode:
                 shNode = slicer.vtkMRMLSubjectHierarchyNode.GetSubjectHierarchyNode(slicer.mrmlScene)
